@@ -29,6 +29,9 @@ const swaras = [
   { label: "Ni", semitones: 11 },
 ];
 
+const MAX_RECONNECT_ATTEMPTS = 8;
+const RECONNECT_MAX_DELAY = 15000;
+
 export default function App() {
   const [saHz, setSaHz] = useState(240);
   const [target, setTarget] = useState(0);
@@ -37,16 +40,40 @@ export default function App() {
   const [result, setResult] = useState(null);
   const [history, setHistory] = useState([]);
   const [error, setError] = useState("");
+  const [connState, setConnState] = useState("idle");
   const socketRef = useRef(null);
   const streamRef = useRef(null);
   const audioContextRef = useRef(null);
   const processorRef = useRef(null);
   const sequenceRef = useRef(0);
+  const configRef = useRef({
+    sample_rate: 48000,
+    sa_hz: 240,
+    target_semitones: 0,
+    tolerance_cents: 25,
+  });
+  const reconnectTimerRef = useRef(null);
+  const reconnectAttemptRef = useRef(0);
+  const closingRef = useRef(false);
 
   useEffect(() => () => stopMic(), []);
 
+  useEffect(() => {
+    configRef.current = {
+      ...configRef.current,
+      sample_rate:
+        audioContextRef.current?.sampleRate ?? configRef.current.sample_rate,
+      sa_hz: Number(saHz),
+      target_semitones: Number(swaras[target].semitones),
+      tolerance_cents: Number(tolerance),
+    };
+  }, [saHz, target, tolerance]);
+
   async function startMic() {
     setError("");
+    closingRef.current = false;
+    reconnectAttemptRef.current = 0;
+    setConnState("connecting");
     try {
       const stream = await navigator.mediaDevices.getUserMedia({
         audio: {
@@ -58,54 +85,26 @@ export default function App() {
       streamRef.current = stream;
       const context = new AudioContext();
       audioContextRef.current = context;
-
-      const wsProtocol = window.location.protocol === "https:" ? "wss" : "ws";
-      const ws = new WebSocket(`${wsProtocol}://${BACKEND_HOST}/ws/live`);
-      socketRef.current = ws;
-      ws.binaryType = "arraybuffer";
-
-      ws.onopen = () => {
-        ws.send(
-          JSON.stringify({
-            sample_rate: context.sampleRate,
-            sa_hz: Number(saHz),
-            target_semitones: Number(swaras[target].semitones),
-            tolerance_cents: Number(tolerance),
-          }),
-        );
-
-        const source = context.createMediaStreamSource(stream);
-        // ScriptProcessorNode is deprecated but widely supported for a small prototype.
-        // Replace with AudioWorklet for a production low-latency app.
-        const processor = context.createScriptProcessor(4096, 1, 1);
-        processorRef.current = processor;
-        processor.onaudioprocess = (event) => {
-          if (ws.readyState !== WebSocket.OPEN) return;
-          const input = event.inputBuffer.getChannelData(0);
-          ws.send(input.slice().buffer);
-        };
-        source.connect(processor);
-        processor.connect(context.destination);
-        setRunning(true);
+      configRef.current = {
+        ...configRef.current,
+        sample_rate: context.sampleRate,
       };
 
-      ws.onmessage = (event) => {
-        const data = JSON.parse(event.data);
-        if (data.error) {
-          setError(data.error);
-          return;
-        }
-        setResult(data);
-        if (data.voiced && Number.isFinite(data.error_cents)) {
-          const point = { t: sequenceRef.current++, cents: data.error_cents };
-          setHistory((old) => [...old.slice(-79), point]);
-        }
+      const source = context.createMediaStreamSource(stream);
+      // ScriptProcessorNode is deprecated but widely supported for a small prototype.
+      // Replace with AudioWorklet for a production low-latency app.
+      const processor = context.createScriptProcessor(4096, 1, 1);
+      processorRef.current = processor;
+      processor.onaudioprocess = (event) => {
+        const socket = socketRef.current;
+        if (!socket || socket.readyState !== WebSocket.OPEN) return;
+        const input = event.inputBuffer.getChannelData(0);
+        socket.send(input.slice().buffer);
       };
-      ws.onerror = () =>
-        setError(
-          `Could not connect to the DSP backend at ${BACKEND_HOST}. Is FastAPI running?`,
-        );
-      ws.onclose = () => setRunning(false);
+      source.connect(processor);
+      processor.connect(context.destination);
+      setRunning(true);
+      openSocket();
     } catch (e) {
       setError(
         e?.message || "Microphone access failed. Check browser permissions.",
@@ -114,7 +113,71 @@ export default function App() {
     }
   }
 
+  function openSocket() {
+    const wsProtocol = window.location.protocol === "https:" ? "wss" : "ws";
+    const socket = new WebSocket(`${wsProtocol}://${BACKEND_HOST}/ws/live`);
+    socketRef.current = socket;
+    socket.binaryType = "arraybuffer";
+
+    socket.onopen = () => {
+      reconnectAttemptRef.current = 0;
+      setConnState("live");
+      socket.send(JSON.stringify(configRef.current));
+    };
+
+    socket.onmessage = (event) => {
+      const data = JSON.parse(event.data);
+      if (data.error) {
+        setError(data.error);
+        return;
+      }
+      setResult(data);
+      if (data.voiced && Number.isFinite(data.error_cents)) {
+        const point = { t: sequenceRef.current++, cents: data.error_cents };
+        setHistory((old) => [...old.slice(-79), point]);
+      }
+    };
+
+    socket.onerror = () => {};
+
+    socket.onclose = () => {
+      if (closingRef.current) return;
+      scheduleReconnect();
+    };
+  }
+
+  function scheduleReconnect() {
+    const attempt = reconnectAttemptRef.current++;
+    if (attempt >= MAX_RECONNECT_ATTEMPTS) {
+      setConnState("failed");
+      setError(
+        `Lost the connection to the DSP backend at ${BACKEND_HOST}. The service may be asleep or restarting.`,
+      );
+      return;
+    }
+    setConnState("reconnecting");
+    const delay =
+      Math.min(1000 * 2 ** attempt, RECONNECT_MAX_DELAY) + Math.random() * 500;
+    reconnectTimerRef.current = setTimeout(() => {
+      if (closingRef.current) return;
+      setConnState("connecting");
+      openSocket();
+    }, delay);
+  }
+
+  function retryConnection() {
+    setError("");
+    reconnectAttemptRef.current = 0;
+    setConnState("connecting");
+    openSocket();
+  }
+
   function stopMic() {
+    closingRef.current = true;
+    if (reconnectTimerRef.current) {
+      clearTimeout(reconnectTimerRef.current);
+      reconnectTimerRef.current = null;
+    }
     try {
       processorRef.current?.disconnect();
     } catch {}
@@ -132,6 +195,7 @@ export default function App() {
     } catch {}
     audioContextRef.current = null;
     setRunning(false);
+    setConnState("idle");
   }
 
   const status = result?.status || "waiting";
@@ -151,6 +215,14 @@ export default function App() {
       uncertain: "Low confidence",
       waiting: "Waiting for voice",
     }[status] || status;
+  const connLabel =
+    {
+      idle: "Stopped",
+      connecting: "Connecting",
+      live: "Listening",
+      reconnecting: "Reconnecting",
+      failed: "Disconnected",
+    }[connState] || "Stopped";
   const coachIcon =
     { in_tune: "✓", flat: "↓", sharp: "↑", uncertain: "♪" }[status] || "♪";
   const f0Text = result?.f0 != null ? Number(result.f0).toFixed(1) : null;
@@ -172,9 +244,13 @@ export default function App() {
           <div className="eyebrow">REAL-TIME MUSIC COACH</div>
           <h1>Sadhana</h1>
         </div>
-        <div className={`live-pill ${running ? "active" : ""}`}>
+        <div
+          className={`live-pill ${running ? "active" : ""} ${
+            connState === "reconnecting" || connState === "failed" ? "warn" : ""
+          }`}
+        >
           <span />
-          {running ? "Listening" : "Stopped"}
+          {running ? connLabel : "Stopped"}
         </div>
       </header>
 
@@ -266,7 +342,21 @@ export default function App() {
             Microphone runs only during your session.
           </span>
         </div>
-        {error && <div className="error-box">{error}</div>}
+        {error && (
+          <div className="error-box">
+            <span>{error}</span>
+            {connState === "failed" && (
+              <button className="retry-btn" onClick={retryConnection}>
+                Retry connection
+              </button>
+            )}
+          </div>
+        )}
+        {connState === "reconnecting" && !error && (
+          <div className="notice-box">
+            Backend connection lost — retrying automatically.
+          </div>
+        )}
       </section>
 
       <section className="scene-shell">

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 from collections import deque
 from typing import Optional
 
@@ -8,10 +9,18 @@ import numpy as np
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 
+DEFAULT_ORIGINS = "http://localhost:5173,http://127.0.0.1:5173"
+
+
+def _allowed_origins() -> list[str]:
+    raw = os.environ.get("ALLOWED_ORIGINS", DEFAULT_ORIGINS)
+    return [origin.strip() for origin in raw.split(",") if origin.strip()]
+
+
 app = FastAPI(title="Sadhana", version="0.2.0")
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:5173", "http://127.0.0.1:5173"],
+    allow_origins=_allowed_origins(),
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],

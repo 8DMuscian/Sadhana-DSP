@@ -40,6 +40,48 @@ npm run dev
 
 Open the Vite URL printed in the terminal (usually `http://localhost:5173`). The backend host is configured through the `VITE_BACKEND_HOST` variable in `frontend/.env` (default `127.0.0.1:8000`); change it there to point the frontend at a different backend without editing source.
 
+## Deploy on Render
+
+Deploy as two services: a Python **Web Service** for the DSP backend and a **Static Site** for the Vite build. Create the backend first so you know its hostname.
+
+### 1. Backend — New > Web Service
+
+| Field | Value |
+| --- | --- |
+| Name | `sadhana-api` |
+| Root Directory | `backend` |
+| Build Command | `pip install -r requirements.txt` |
+| Start Command | `uvicorn main:app --host 0.0.0.0 --port $PORT` |
+| Health Check Path | `/health` |
+| Instance Type | Free (or Starter) |
+
+Environment variables:
+
+- `ALLOWED_ORIGINS` — comma-separated browser origins allowed to call the API, e.g. `https://sadhana.onrender.com`. Defaults to the two localhost dev origins.
+- `PYTHON_VERSION` — e.g. `3.12.8`, to pin the interpreter.
+
+The service must bind `0.0.0.0` on `$PORT` (Render's default is 10000). Do not keep Render's default `gunicorn` start command — gunicorn is not a dependency of this project.
+
+### 2. Frontend — New > Static Site
+
+| Field | Value |
+| --- | --- |
+| Name | `sadhana` |
+| Root Directory | `frontend` |
+| Build Command | `npm ci && npm run build` |
+| Publish Directory | `dist` |
+
+Environment variable:
+
+- `VITE_BACKEND_HOST` — the backend hostname **without** a scheme or trailing slash, e.g. `sadhana-api.onrender.com`. The page protocol decides `ws://` versus `wss://`.
+
+`VITE_BACKEND_HOST` is read at **build time** and baked into the bundle, so changing it requires a new deploy of the static site.
+
+### Free-tier notes
+
+- A free web service spins down after 15 minutes without inbound traffic and takes about a minute to wake up. The frontend reconnects automatically with exponential backoff and shows a **Reconnecting** state, so a session recovers on its own.
+- Microphone capture needs a secure context; `https://*.onrender.com` qualifies.
+
 ## How to use
 
 1. Start the backend and frontend.
